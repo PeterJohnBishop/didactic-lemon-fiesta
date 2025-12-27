@@ -23,6 +23,25 @@ type Hub struct {
 	mu      sync.RWMutex
 }
 
+func LaunchRelayServer() {
+	port := os.Getenv("SERVER_PORT")
+	hub := &Hub{clients: make(map[string]*Client)}
+	listener, err := net.Listen("tcp", port)
+	if err != nil {
+		fmt.Println("Error starting server:", err)
+		return
+	}
+
+	fmt.Println("Relay server started on :8080")
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		go hub.handleWithHeartbeat(conn)
+	}
+}
+
 // goroutines for each client to handle outgoing messages
 func (c *Client) writeLoop() {
 	for msg := range c.Outgoing {
@@ -109,24 +128,5 @@ func (h *Hub) forward(targetID string, payload []byte) {
 		default:
 			fmt.Printf("Outgoing buffer full for %s, dropping packet\n", targetID)
 		}
-	}
-}
-
-func StartRelayServer() {
-	port := os.Getenv("SERVER_PORT")
-	hub := &Hub{clients: make(map[string]*Client)}
-	listener, err := net.Listen("tcp", port)
-	if err != nil {
-		fmt.Println("Error starting server:", err)
-		return
-	}
-
-	fmt.Println("Relay server started on :8080")
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			continue
-		}
-		go hub.handleWithHeartbeat(conn)
 	}
 }
