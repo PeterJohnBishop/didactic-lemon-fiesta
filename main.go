@@ -12,7 +12,7 @@ func main() {
 	switch role {
 	case "server":
 		fmt.Println("Starting server...")
-		server.StartRelayServer()
+		server.LaunchRelayServer()
 	case "client":
 		fmt.Println("Starting relay client...")
 		relayclient.LaunchRelayClient()

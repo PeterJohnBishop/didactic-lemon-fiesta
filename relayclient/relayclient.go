@@ -1,34 +1,55 @@
 package relayclient
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"time"
 )
 
+const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+func GenerateID(length int) (string, error) {
+	result := make([]byte, length)
+	for i := range result {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", err
+		}
+		result[i] = charset[num.Int64()]
+	}
+	return string(result), nil
+}
+
 func LaunchRelayClient() {
 	url := os.Getenv("SERVER_URL")
+	// clientID, err := GenerateID(8)
 	clientID := os.Getenv("CLIENT_ID")
 	targetID := os.Getenv("TARGET_ID")
-
-	if url == "" || clientID == "" || targetID == "" {
-		fmt.Println("Please set SERVER_URL, CLIENT_ID, and TARGET_ID environment variables.")
-		return
+	filepathEnv := os.Getenv("FILE")
+	var data *ChunkMetadata
+	var err error
+	if filepathEnv != "" {
+		data, err = splitFile(filepathEnv)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf(data.FileName)
 	}
-
+	// dial server
 	conn, err := net.Dial("tcp", url)
 	if err != nil {
 		panic(err)
 	}
 	defer conn.Close()
 
-	myID := clientID
-	fmt.Printf("Registering as %s...\n", myID)
+	fmt.Printf("Registering as %s...\n", clientID)
 
-	conn.Write([]byte{byte(len(myID))})
-	conn.Write([]byte(myID))
+	conn.Write([]byte{byte(len(clientID))})
+	conn.Write([]byte(clientID))
 
 	go func() {
 		for {
@@ -42,25 +63,48 @@ func LaunchRelayClient() {
 		}
 	}()
 
-	// test data sending
-	message := "Hello from " + clientID + "!"
+	if data != nil {
 
-	for {
-		fmt.Printf("Sending message to %s...\n", targetID)
+		for {
+			payload := fmt.Sprintf("Metadata: %s (%d chunks)", data.FileName, data.NumChunks)
+			// target ID Length
+			conn.Write([]byte{byte(len(targetID))})
 
-		// target ID Length
-		conn.Write([]byte{byte(len(targetID))})
+			// target ID
+			conn.Write([]byte(targetID))
 
-		// target ID
-		conn.Write([]byte(targetID))
+			// payload Size
+			pSize := uint32(len(payload))
+			binary.Write(conn, binary.BigEndian, pSize)
 
-		// payload Size
-		pSize := uint32(len(message))
-		binary.Write(conn, binary.BigEndian, pSize)
+			// payload
+			conn.Write([]byte(payload))
 
-		// payload
-		conn.Write([]byte(message))
+			time.Sleep(5 * time.Second)
+		}
+	} else {
 
-		time.Sleep(5 * time.Second)
+		// test data sending
+		message := "File: " + clientID + "!"
+
+		for {
+			fmt.Printf("Sending message to %s...\n", targetID)
+
+			// target ID Length
+			conn.Write([]byte{byte(len(targetID))})
+
+			// target ID
+			conn.Write([]byte(targetID))
+
+			// payload Size
+			pSize := uint32(len(message))
+			binary.Write(conn, binary.BigEndian, pSize)
+
+			// payload
+			conn.Write([]byte(message))
+
+			time.Sleep(5 * time.Second)
+		}
 	}
+
 }
