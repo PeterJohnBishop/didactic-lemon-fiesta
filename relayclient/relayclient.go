@@ -3,10 +3,12 @@ package relayclient
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -26,85 +28,84 @@ func GenerateID(length int) (string, error) {
 
 func LaunchRelayClient() {
 	url := os.Getenv("SERVER_URL")
-	// clientID, err := GenerateID(8)
-	clientID := os.Getenv("CLIENT_ID")
-	targetID := os.Getenv("TARGET_ID")
+	secret := os.Getenv("SECRET")
 	filepathEnv := os.Getenv("FILE")
-	var data *ChunkMetadata
-	var err error
-	if filepathEnv != "" {
-		data, err = splitFile(filepathEnv)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Printf(data.FileName)
+	clientID, _ := GenerateID(8)
+
+	if url == "" || secret == "" {
+		fmt.Println("Error: SERVER_URL and SECRET are required.")
+		return
 	}
-	// dial server
+
+	var metadata *ChunkMetadata
+	if filepathEnv != "" {
+		var err error
+		metadata, err = splitFile(filepathEnv)
+		if err != nil {
+			fmt.Printf("Error splitting file: %v\n", err)
+			return
+		}
+	}
+
 	conn, err := net.Dial("tcp", url)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Connection failed: %v\n", err)
+		return
 	}
 	defer conn.Close()
 
-	fmt.Printf("Registering as %s...\n", clientID)
-
+	// 1. Handshake
+	fmt.Printf("Registering as %s with secret...\n", clientID)
 	conn.Write([]byte{byte(len(clientID))})
 	conn.Write([]byte(clientID))
+	conn.Write([]byte{byte(len(secret))})
+	conn.Write([]byte(secret))
+
+	connectedSignal := make(chan string, 1)
 
 	go func() {
+		defer close(connectedSignal)
+
 		for {
 			buf := make([]byte, 1024)
 			n, err := conn.Read(buf)
 			if err != nil {
-				fmt.Println("Disconnected from server")
+				fmt.Printf("\n[ERROR] Connection closed: %v\n", err)
 				return
 			}
-			fmt.Printf("\n[RECEIVED]: %s\n", string(buf[:n]))
+			msg := string(buf[:n])
+			fmt.Printf("\n[RECEIVED]: %s\n", msg)
+
+			if strings.HasPrefix(msg, "CONNECTED:") {
+				peerID := strings.TrimPrefix(msg, "CONNECTED:")
+				connectedSignal <- peerID
+			}
 		}
 	}()
 
-	if data != nil {
+	fmt.Println("Awaiting peer match via secret...")
 
-		for {
-			payload := fmt.Sprintf("Metadata: %s (%d chunks)", data.FileName, data.NumChunks)
-			// target ID Length
-			conn.Write([]byte{byte(len(targetID))})
+	peerID, ok := <-connectedSignal
+	if !ok {
+		fmt.Println("Exiting: Connection to relay was lost before matching occurred.")
+		return
+	}
+	fmt.Printf("Successfully matched with peer: %s\n", peerID)
 
-			// target ID
-			conn.Write([]byte(targetID))
-
-			// payload Size
-			pSize := uint32(len(payload))
-			binary.Write(conn, binary.BigEndian, pSize)
-
-			// payload
-			conn.Write([]byte(payload))
-
-			time.Sleep(5 * time.Second)
-		}
-	} else {
-
-		// test data sending
-		message := "File: " + clientID + "!"
-
-		for {
-			fmt.Printf("Sending message to %s...\n", targetID)
-
-			// target ID Length
-			conn.Write([]byte{byte(len(targetID))})
-
-			// target ID
-			conn.Write([]byte(targetID))
-
-			// payload Size
-			pSize := uint32(len(message))
-			binary.Write(conn, binary.BigEndian, pSize)
-
-			// payload
-			conn.Write([]byte(message))
-
-			time.Sleep(5 * time.Second)
-		}
+	if metadata != nil {
+		metaJSON, _ := json.Marshal(metadata)
+		sendPayload(conn, metaJSON)
+		fmt.Printf("Sent metadata for: %s\n", metadata.FileName)
 	}
 
+	for {
+		binary.Write(conn, binary.BigEndian, uint32(0))
+		time.Sleep(20 * time.Second)
+	}
+}
+
+func sendPayload(conn net.Conn, data []byte) {
+	pSize := uint32(len(data))
+	binary.Write(conn, binary.BigEndian, pSize)
+	conn.Write(data)
 }

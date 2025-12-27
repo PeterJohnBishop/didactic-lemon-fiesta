@@ -13,19 +13,25 @@ import (
 
 type Client struct {
 	ID       string
+	Secret   string
+	TargetID string
 	Conn     net.Conn
 	Writer   *bufio.Writer
-	Outgoing chan []byte // Channel to handle outgoing data asynchronously
+	Outgoing chan []byte
 }
 
 type Hub struct {
+	secrets map[string]string
 	clients map[string]*Client
 	mu      sync.RWMutex
 }
 
 func LaunchRelayServer() {
 	port := os.Getenv("SERVER_PORT")
-	hub := &Hub{clients: make(map[string]*Client)}
+	hub := &Hub{
+		clients: make(map[string]*Client),
+		secrets: make(map[string]string),
+	}
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		fmt.Println("Error starting server:", err)
@@ -42,7 +48,6 @@ func LaunchRelayServer() {
 	}
 }
 
-// goroutines for each client to handle outgoing messages
 func (c *Client) writeLoop() {
 	for msg := range c.Outgoing {
 		c.Writer.Write(msg)
@@ -57,63 +62,92 @@ func (h *Hub) handleWithHeartbeat(conn net.Conn) {
 	if _, err := io.ReadFull(conn, idLenBuf); err != nil {
 		return
 	}
-
 	idBuf := make([]byte, idLenBuf[0])
-	if _, err := io.ReadFull(conn, idBuf); err != nil {
-		return
-	}
+	io.ReadFull(conn, idBuf)
+	clientID := string(idBuf)
+
+	secretLenBuf := make([]byte, 1)
+	io.ReadFull(conn, secretLenBuf)
+	secretBuf := make([]byte, secretLenBuf[0])
+	io.ReadFull(conn, secretBuf)
+	secret := string(secretBuf)
 
 	client := &Client{
-		ID:       string(idBuf),
+		ID:       clientID,
+		Secret:   secret,
 		Conn:     conn,
 		Writer:   bufio.NewWriterSize(conn, 4096),
-		Outgoing: make(chan []byte, 100), // Buffer up to 100 messages
+		Outgoing: make(chan []byte, 100),
 	}
 
 	h.mu.Lock()
+
+	peerID, matched := h.secrets[secret]
+
+	if matched && peerID != client.ID {
+		peer := h.clients[peerID]
+
+		client.TargetID = peer.ID
+		peer.TargetID = client.ID
+
+		delete(h.secrets, secret)
+		h.mu.Unlock()
+
+		client.Outgoing <- []byte("CONNECTED:" + peer.ID)
+		peer.Outgoing <- []byte("CONNECTED:" + client.ID)
+
+		go client.writeLoop()
+		h.runRelayLoop(client)
+		return
+	}
+
 	h.clients[client.ID] = client
+	h.secrets[secret] = client.ID
 	h.mu.Unlock()
 
-	go client.writeLoop() // writeLoop for outgoing messages starts
+	go client.writeLoop()
 
 	defer func() {
 		h.mu.Lock()
 		delete(h.clients, client.ID)
+		delete(h.secrets, client.Secret)
 		h.mu.Unlock()
-		close(client.Outgoing) // writeLoop stops
-		fmt.Printf("Client %s disconnected\n", client.ID)
+		close(client.Outgoing)
 	}()
 
-	fmt.Printf("Client %s registered\n", client.ID)
+	h.runRelayLoop(client)
+}
 
+func (h *Hub) runRelayLoop(client *Client) {
 	for {
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		client.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
-		// Read Target ID Length
-		if _, err := io.ReadFull(conn, idLenBuf); err != nil {
-			break
-		}
-
-		// Read Target ID
-		tIDBuf := make([]byte, idLenBuf[0])
-		if _, err := io.ReadFull(conn, tIDBuf); err != nil {
-			break
-		}
-		targetID := string(tIDBuf)
-
-		// Read Payload Size
 		var pSize uint32
-		if err := binary.Read(conn, binary.BigEndian, &pSize); err != nil {
+		if err := binary.Read(client.Conn, binary.BigEndian, &pSize); err != nil {
 			break
 		}
 
-		// Read Payload
 		payload := make([]byte, pSize)
-		if _, err := io.ReadFull(conn, payload); err != nil {
+		if _, err := io.ReadFull(client.Conn, payload); err != nil {
 			break
 		}
 
-		h.forward(targetID, payload)
+		h.mu.RLock()
+		targetID := client.TargetID
+
+		if targetID == "" {
+			// recheck the client in the hub
+			if self, exists := h.clients[client.ID]; exists {
+				targetID = self.TargetID
+			}
+		}
+		h.mu.RUnlock()
+
+		if targetID != "" {
+			h.forward(targetID, payload)
+		} else {
+			fmt.Printf("Client %s is sending data but has no target yet\n", client.ID)
+		}
 	}
 }
 
