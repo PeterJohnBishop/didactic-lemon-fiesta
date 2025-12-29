@@ -15,6 +15,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -37,6 +38,7 @@ func GenerateID(length int) (string, error) {
 var activeDownloadMeta *ChunkMetadata
 var filesMetadata []ChunkMetadata
 var dir string
+var writeMu sync.Mutex
 
 func LaunchRelayClient() {
 	os.MkdirAll("temp_chunks", os.ModePerm)
@@ -91,7 +93,9 @@ func LaunchRelayClient() {
 	regBuf = append(regBuf, byte(len(secret)))
 	regBuf = append(regBuf, []byte(secret)...)
 
+	writeMu.Lock()
 	err = conn.WriteMessage(websocket.BinaryMessage, regBuf)
+	writeMu.Unlock()
 	if err != nil {
 		fmt.Printf("[ERROR] Registration write failed: %v\n", err)
 		return
@@ -193,7 +197,9 @@ func LaunchRelayClient() {
 	}
 
 	for {
+		writeMu.Lock()
 		err := conn.WriteMessage(websocket.PingMessage, nil)
+		writeMu.Unlock()
 		if err != nil {
 			return
 		}
@@ -291,6 +297,9 @@ func wrapChunk(index int, data []byte) []byte {
 }
 
 func sendPayload(conn *websocket.Conn, data []byte) {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
 	err := conn.WriteMessage(websocket.BinaryMessage, data)
 	if err != nil {
 		fmt.Printf("[ERROR] Failed to send payload: %v\n", err)
@@ -368,6 +377,9 @@ func GetAllFiles(root string) ([]string, error) {
 	var files []string
 
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil
+		}
 		if err != nil {
 			log.Printf("Error accessing path %s: %v\n", path, err)
 			return err
