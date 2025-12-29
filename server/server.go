@@ -63,8 +63,16 @@ func LaunchRelayServer() {
 	mux.HandleFunc("/ws", handler)
 
 	fmt.Printf("[SYSTEM] WebSocket Relay active on :%s\n", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
-		log.Fatal(err)
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  0,
+		WriteTimeout: 0,
+		IdleTimeout:  0,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("[ERROR] Server failed: %v\n", err)
 	}
 }
 
