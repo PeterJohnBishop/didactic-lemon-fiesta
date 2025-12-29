@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const basePath = "/Users/peterbishop/Development/didactic-lemon-fiesta"
@@ -14,13 +15,14 @@ const basePath = "/Users/peterbishop/Development/didactic-lemon-fiesta"
 const ChunkSize = 1 * 1024 * 1024 // 1MB
 
 type ChunkMetadata struct {
-	FileName    string   `json:"file_name"`
-	ChunkSize   int      `json:"chunk_size"`
-	NumChunks   int      `json:"num_chunks"`
-	ChunkHashes []string `json:"chunk_hashes"`
+	FileName    string    `json:"file_name"`
+	ChunkSize   int       `json:"chunk_size"`
+	NumChunks   int       `json:"num_chunks"`
+	ChunkHashes []string  `json:"chunk_hashes"`
+	ModTime     time.Time `json:"mod_time"`
 }
 
-func splitFile(filePath string) (*ChunkMetadata, error) {
+func splitFile(filePath string, modTime time.Time) (*ChunkMetadata, error) {
 	fmt.Println("Starting chunking process...")
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -61,6 +63,7 @@ func splitFile(filePath string) (*ChunkMetadata, error) {
 		ChunkSize:   ChunkSize,
 		NumChunks:   numChunks,
 		ChunkHashes: hashes,
+		ModTime:     modTime,
 	}
 
 	metaBytes, _ := json.MarshalIndent(meta, "", "  ")

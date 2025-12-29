@@ -33,13 +33,13 @@ func GenerateID(length int) (string, error) {
 }
 
 var activeDownloadMeta *ChunkMetadata
+var filesMetadata []ChunkMetadata
+var dir string
 
 func LaunchRelayClient() {
 	// create necessary directories
-	// os.MkdirAll("downloads", os.ModePerm) moving to /User/macbookair/Downloads
 	os.MkdirAll("temp_chunks", os.ModePerm)
 	os.MkdirAll("chunks", os.ModePerm)
-
 	url := os.Getenv("SERVER_URL")
 	secret := os.Getenv("SECRET")
 	clientID, _ := GenerateID(8)
@@ -49,32 +49,15 @@ func LaunchRelayClient() {
 		return
 	}
 
-	// scan Downloads directory for files
 	currentUser, err := user.Current()
 	if err != nil {
 		log.Fatalf("Failed to get current user: %v", err)
 	}
-	rootDir := "/Users/" + currentUser.Username + "/Downloads"
-	files, err := GetAllFiles(rootDir)
-	if err != nil {
-		log.Fatal(err)
-	}
+	dir := "/Users/" + currentUser.Username + "/Downloads"
 
-	fmt.Printf("Found %d files in %s and its subdirectories:\n", len(files), rootDir)
-	var metadata *ChunkMetadata
-	var filesMetadata []ChunkMetadata
-	// send metadata for each file to be relayed
-	for _, file := range files {
-		fmt.Println(file)
-		if file != "" {
-			var err error
-			metadata, err = splitFile(file)
-			if err != nil {
-				fmt.Printf("[ERROR] file split failed: %v\n", err)
-				return
-			}
-			filesMetadata = append(filesMetadata, *metadata)
-		}
+	filesMetadata, err := scanForFiles(dir)
+	if err != nil {
+		log.Fatalf("Failed to scan for files: %v", err)
 	}
 
 	conn, err := net.Dial("tcp", url)
@@ -224,6 +207,42 @@ func LaunchRelayClient() {
 	}
 }
 
+func scanForFiles(dir string) ([]ChunkMetadata, error) {
+	// scan Downloads directory for files
+
+	files, err := GetAllFiles(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Found %d files in %s and its subdirectories:\n", len(files), dir)
+	var metadata *ChunkMetadata
+	var allMetadata []ChunkMetadata
+	for _, file := range files {
+		fmt.Println(file)
+		info, err := os.Stat(file)
+		if err != nil {
+			log.Printf("Could not stat file %s: %v", file, err)
+			continue
+		}
+
+		// Get the last modified time
+		modTime := info.ModTime()
+
+		if file != "" {
+			var err error
+			metadata, err = splitFile(file, modTime)
+			if err != nil {
+				fmt.Printf("[ERROR] file split failed: %v\n", err)
+				return nil, err
+			}
+			allMetadata = append(allMetadata, *metadata)
+		}
+	}
+
+	return allMetadata, nil
+}
+
 func getMapKeys(m map[string]interface{}) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -241,14 +260,9 @@ func checkProgress(meta *ChunkMetadata) {
 
 	fmt.Printf("\r[RECEIVER] download progress: %.2f%% (%d/%d chunks)", percent, count, meta.NumChunks)
 
-	currentUser, err := user.Current()
-	if err != nil {
-		log.Fatalf("Failed to get current user: %v", err)
-	}
-
 	if count == meta.NumChunks {
 		fmt.Println("\n[RECEIVER] Transfer complete, reassembling...")
-		if err := ReassembleFile(*meta, "/Users/"+currentUser.Username+"/Downloads"); err == nil {
+		if err := ReassembleFile(*meta, dir); err == nil {
 			VerifyAndFinalize(*meta)
 			for _, m := range matches {
 				os.Remove(m)
@@ -326,11 +340,6 @@ func ReassembleFile(meta ChunkMetadata, outputDir string) error {
 // post-reassembly SHA256 integrity check
 func VerifyAndFinalize(meta ChunkMetadata) {
 	fmt.Println("[SYSTEM] SHA256 integrity check...")
-	currentUser, err := user.Current()
-	if err != nil {
-		log.Fatalf("Failed to get current user: %v", err)
-	}
-	dir := "/Users/" + currentUser.Username + "/Downloads"
 	finalPath := filepath.Join(dir, meta.FileName)
 	f, _ := os.Open(finalPath)
 	defer f.Close()
@@ -350,16 +359,12 @@ func VerifyAndFinalize(meta ChunkMetadata) {
 func GetAllFiles(root string) ([]string, error) {
 	var files []string
 
-	// filepath.WalkDir walks the file tree rooted at root, calling a function for each file or directory.
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// Handle the error and decide whether to continue or stop walking
-			// (e.g., a permission error on a specific subdirectory).
 			log.Printf("Error accessing path %s: %v\n", path, err)
 			return err
 		}
 
-		// Check if the current entry is a file (not a directory).
 		if !d.IsDir() {
 			files = append(files, path)
 		}
