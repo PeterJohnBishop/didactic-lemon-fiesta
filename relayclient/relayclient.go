@@ -56,7 +56,6 @@ func LaunchRelayClient() {
 	if err != nil {
 		log.Fatalf("Failed to get current user: %v", err)
 	}
-	// Use package-level 'dir' variable
 	dir = "/Users/" + currentUser.Username + "/Downloads"
 
 	filesMetadata, err = scanForFiles(dir)
@@ -145,8 +144,11 @@ func LaunchRelayClient() {
 				if _, ok := generic["file_name"]; ok {
 					var incomingMeta ChunkMetadata
 					if err := json.Unmarshal(payload, &incomingMeta); err == nil {
-						fmt.Printf("[RECEIVER] Manifest received: %s (%d chunks)\n", incomingMeta.FileName, incomingMeta.NumChunks)
+						fmt.Printf("[RECEIVER] Manifest: %s\n", incomingMeta.FileName)
 						activeDownloadMeta = &incomingMeta
+
+						checkProgress(activeDownloadMeta)
+
 						go handleIncomingMetadata(conn, incomingMeta)
 					}
 					continue
@@ -232,9 +234,19 @@ func scanForFiles(dir string) ([]ChunkMetadata, error) {
 }
 
 func handleIncomingMetadata(conn *websocket.Conn, meta ChunkMetadata) {
-	time.Sleep(2 * time.Second)
+	fmt.Printf("[RECEIVER] Syncing %s (%d chunks)\n", meta.FileName, meta.NumChunks)
+
+	time.Sleep(1 * time.Second)
 
 	for i, hash := range meta.ChunkHashes {
+		chunkPath := filepath.Join("temp_chunks", fmt.Sprintf("%s.part.%d", meta.FileName, i))
+
+		if info, err := os.Stat(chunkPath); err == nil {
+			if info.Size() > 0 {
+				continue
+			}
+		}
+
 		request := map[string]interface{}{
 			"type":  "CHUNK_REQ",
 			"index": i,
@@ -244,7 +256,12 @@ func handleIncomingMetadata(conn *websocket.Conn, meta ChunkMetadata) {
 		reqBytes, _ := json.Marshal(request)
 		sendPayload(conn, reqBytes)
 
-		time.Sleep(250 * time.Millisecond)
+		if i > 0 && i%50 == 0 {
+			fmt.Printf("\n[DEBUG] Batch pause at chunk %d to clear buffers...\n", i)
+			time.Sleep(1500 * time.Millisecond)
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
 
@@ -263,7 +280,6 @@ func GetAllFiles(root string) ([]string, error) {
 		if err != nil {
 			return err
 		}
-		// Ignore hidden files/system files
 		if strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
