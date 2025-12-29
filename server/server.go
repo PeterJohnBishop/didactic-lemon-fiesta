@@ -38,7 +38,17 @@ func LaunchRelayServer() {
 		secrets: make(map[string]string),
 	}
 
+	var upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Printf("[DEBUG] Incoming Request: %s %s from %s\n", r.Method, r.URL.Path, r.RemoteAddr)
+
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			fmt.Printf("[ERROR] Upgrade failed: %v\n", err)

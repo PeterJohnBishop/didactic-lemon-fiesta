@@ -60,13 +60,20 @@ func LaunchRelayClient() {
 		log.Fatalf("Failed to scan for files: %v", err)
 	}
 
-	// Connect using WebSockets (WSS for Heroku)
-	u := "wss://relaysvr-didactic-lemon-fiesta.herokuapp.com/"
+	u := "wss://relaysvr-didactic-lemon-fiesta.herokuapp.com"
 	fmt.Printf("[SYSTEM] Connecting to %s...\n", u)
 
-	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	fmt.Printf("[SYSTEM] Dialing %s...\n", u)
+	conn, resp, err := dialer.Dial(u, nil)
 	if err != nil {
-		log.Fatalf("[ERROR] WebSocket connection failed: %v", err)
+		if resp != nil {
+			fmt.Printf("[ERROR] Handshake failed with status: %s\n", resp.Status)
+		}
+		log.Fatalf("[ERROR] WebSocket Dial: %v", err)
 	}
 	defer conn.Close()
 
@@ -107,7 +114,7 @@ func LaunchRelayClient() {
 			headerByte := payload[0]
 
 			switch headerByte {
-			case 0xAA: // File Chunk
+			case 0xAA:
 				if len(payload) < 5 {
 					continue
 				}
@@ -121,13 +128,12 @@ func LaunchRelayClient() {
 					fmt.Println("[LOG] Error: activeDownloadMeta is nil, cannot save chunk")
 				}
 
-			case '{': // JSON Metadata or Requests
+			case '{':
 				var generic map[string]interface{}
 				if err := json.Unmarshal(payload, &generic); err != nil {
 					continue
 				}
 
-				// Case: Incoming File Manifest
 				if _, ok := generic["file_name"]; ok {
 					var incomingMeta ChunkMetadata
 					if err := json.Unmarshal(payload, &incomingMeta); err == nil {
@@ -138,7 +144,6 @@ func LaunchRelayClient() {
 					continue
 				}
 
-				// Case: Peer Requesting a Chunk
 				if val, ok := generic["type"].(string); ok && val == "CHUNK_REQ" {
 					fileName, okF := generic["file"].(string)
 					indexFloat, okI := generic["index"].(float64)
@@ -192,7 +197,6 @@ func LaunchRelayClient() {
 }
 
 func scanForFiles(dir string) ([]ChunkMetadata, error) {
-	// scan Downloads directory for files
 	files, err := GetAllFiles(dir)
 	if err != nil {
 		log.Fatal(err)
@@ -234,7 +238,6 @@ func getMapKeys(m map[string]interface{}) []string {
 	return keys
 }
 
-// monitors download completion
 func checkProgress(meta *ChunkMetadata) {
 	pattern := filepath.Join("temp_chunks", fmt.Sprintf("%s.part.*", meta.FileName))
 	matches, _ := filepath.Glob(pattern)
@@ -254,7 +257,6 @@ func checkProgress(meta *ChunkMetadata) {
 	}
 }
 
-// requests all chunks from the peer
 func handleIncomingMetadata(conn *websocket.Conn, meta ChunkMetadata) {
 	time.Sleep(500 * time.Millisecond)
 	for i, hash := range meta.ChunkHashes {
@@ -290,14 +292,11 @@ func sendPayload(conn *websocket.Conn, data []byte) {
 	}
 }
 
-// merges chunks into final file
 func ReassembleFile(meta ChunkMetadata) error {
 	finalPath := filepath.Join(dir, meta.FileName)
 	tempPath := finalPath + ".tmp"
 
-	// check if file already exists
 	if _, err := os.Stat(finalPath); err == nil {
-		// file exists, verify if it's identical
 		isMatch, err := VerifyExistingFile(meta, finalPath)
 		if err != nil {
 			return err
@@ -308,7 +307,6 @@ func ReassembleFile(meta ChunkMetadata) error {
 			return cleanupChunks(meta)
 		}
 
-		// not a match, check ModTime
 		existingInfo, _ := os.Stat(finalPath)
 		if !meta.ModTime.After(existingInfo.ModTime()) {
 			fmt.Printf("[SKIP] Existing %s is newer or same age. Dropping update.\n", meta.FileName)
@@ -337,14 +335,12 @@ func ReassembleFile(meta ChunkMetadata) error {
 		return err
 	}
 
-	// update the local file's ModTime to match the source metadata
 	os.Chtimes(finalPath, time.Now(), meta.ModTime)
 
 	fmt.Printf("Successfully finalized: %s\n", finalPath)
 	return cleanupChunks(meta)
 }
 
-// post-reassembly SHA256 integrity check
 func VerifyAndFinalize(meta ChunkMetadata) {
 	fmt.Println("[SYSTEM] SHA256 integrity check...")
 	finalPath := filepath.Join(dir, meta.FileName)
@@ -385,7 +381,6 @@ func GetAllFiles(root string) ([]string, error) {
 	return files, nil
 }
 
-// Returns true if the existing file matches the metadata hashes
 func VerifyExistingFile(meta ChunkMetadata, filePath string) (bool, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -402,10 +397,10 @@ func VerifyExistingFile(meta ChunkMetadata, filePath string) (bool, error) {
 
 		actualHash := fmt.Sprintf("%x", sha256.Sum256(buf[:n]))
 		if actualHash != expectedHash {
-			return false, nil // Mismatch found
+			return false, nil
 		}
 	}
-	return true, nil // Bit-perfect match
+	return true, nil
 }
 
 func cleanupChunks(meta ChunkMetadata) error {
