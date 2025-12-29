@@ -40,7 +40,7 @@ func LaunchRelayClient() {
 	// create necessary directories
 	os.MkdirAll("temp_chunks", os.ModePerm)
 	os.MkdirAll("chunks", os.ModePerm)
-	url := os.Getenv("SERVER_URL")
+	url := "https://dashboard.heroku.com/apps/relaysvr-didactic-lemon-fiesta"
 	secret := os.Getenv("SECRET")
 	clientID, _ := GenerateID(8)
 
@@ -262,7 +262,7 @@ func checkProgress(meta *ChunkMetadata) {
 
 	if count == meta.NumChunks {
 		fmt.Println("\n[RECEIVER] Transfer complete, reassembling...")
-		if err := ReassembleFile(*meta, dir); err == nil {
+		if err := ReassembleFile(*meta); err == nil {
 			VerifyAndFinalize(*meta)
 			for _, m := range matches {
 				os.Remove(m)
@@ -320,21 +320,57 @@ func sendPayload(conn net.Conn, data []byte) {
 }
 
 // merges chunks into final file
-func ReassembleFile(meta ChunkMetadata, outputDir string) error {
-	finalPath := filepath.Join(outputDir, meta.FileName)
-	out, err := os.Create(finalPath)
+func ReassembleFile(meta ChunkMetadata) error {
+	finalPath := filepath.Join(dir, meta.FileName)
+	tempPath := finalPath + ".tmp"
+
+	// check if file already exists
+	if _, err := os.Stat(finalPath); err == nil {
+		// file exists, verify if it's identical
+		isMatch, err := VerifyExistingFile(meta, finalPath)
+		if err != nil {
+			return err
+		}
+
+		if isMatch {
+			fmt.Printf("[SKIP] %s is already bit-perfect. Deleting incoming chunks.\n", meta.FileName)
+			return cleanupChunks(meta)
+		}
+
+		// not a match, check ModTime
+		existingInfo, _ := os.Stat(finalPath)
+		if !meta.ModTime.After(existingInfo.ModTime()) {
+			fmt.Printf("[SKIP] Existing %s is newer or same age. Dropping update.\n", meta.FileName)
+			return cleanupChunks(meta)
+		}
+		fmt.Printf("[UPDATE] Incoming %s is newer. Replacing old file...\n", meta.FileName)
+	}
+
+	out, err := os.Create(tempPath)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	for i := 0; i < meta.NumChunks; i++ {
 		chunkPath := filepath.Join("temp_chunks", fmt.Sprintf("%s.part.%d", meta.FileName, i))
-		content, _ := os.ReadFile(chunkPath)
+		content, err := os.ReadFile(chunkPath)
+		if err != nil {
+			out.Close()
+			return err
+		}
 		out.Write(content)
 	}
-	fmt.Printf("successfully reassembled: %s\n", finalPath)
-	return nil
+	out.Close()
+
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return err
+	}
+
+	// update the local file's ModTime to match the source metadata
+	os.Chtimes(finalPath, time.Now(), meta.ModTime)
+
+	fmt.Printf("Successfully finalized: %s\n", finalPath)
+	return cleanupChunks(meta)
 }
 
 // post-reassembly SHA256 integrity check
@@ -376,4 +412,35 @@ func GetAllFiles(root string) ([]string, error) {
 	}
 
 	return files, nil
+}
+
+// Returns true if the existing file matches the metadata hashes
+func VerifyExistingFile(meta ChunkMetadata, filePath string) (bool, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	for _, expectedHash := range meta.ChunkHashes {
+		buf := make([]byte, meta.ChunkSize)
+		n, err := f.Read(buf)
+		if err != nil && err != io.EOF {
+			return false, err
+		}
+
+		actualHash := fmt.Sprintf("%x", sha256.Sum256(buf[:n]))
+		if actualHash != expectedHash {
+			return false, nil // Mismatch found
+		}
+	}
+	return true, nil // Bit-perfect match
+}
+
+func cleanupChunks(meta ChunkMetadata) error {
+	for i := 0; i < meta.NumChunks; i++ {
+		chunkPath := filepath.Join("temp_chunks", fmt.Sprintf("%s.part.%d", meta.FileName, i))
+		os.Remove(chunkPath)
+	}
+	return nil
 }
