@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
+	"log"
 	"math/big"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
@@ -33,13 +36,12 @@ var activeDownloadMeta *ChunkMetadata
 
 func LaunchRelayClient() {
 	// create necessary directories
-	os.MkdirAll("downloads", os.ModePerm)
+	// os.MkdirAll("downloads", os.ModePerm) moving to /User/macbookair/Downloads
 	os.MkdirAll("temp_chunks", os.ModePerm)
 	os.MkdirAll("chunks", os.ModePerm)
 
 	url := os.Getenv("SERVER_URL")
 	secret := os.Getenv("SECRET")
-	filepathEnv := os.Getenv("FILE")
 	clientID, _ := GenerateID(8)
 
 	if url == "" || secret == "" {
@@ -47,13 +49,31 @@ func LaunchRelayClient() {
 		return
 	}
 
+	// scan Downloads directory for files
+	currentUser, err := user.Current()
+	if err != nil {
+		log.Fatalf("Failed to get current user: %v", err)
+	}
+	rootDir := "/Users/" + currentUser.Username + "/Downloads"
+	files, err := GetAllFiles(rootDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Found %d files in %s and its subdirectories:\n", len(files), rootDir)
 	var metadata *ChunkMetadata
-	if filepathEnv != "" {
-		var err error
-		metadata, err = splitFile(filepathEnv)
-		if err != nil {
-			fmt.Printf("[ERROR] file split failed: %v\n", err)
-			return
+	var filesMetadata []ChunkMetadata
+	// send metadata for each file to be relayed
+	for _, file := range files {
+		fmt.Println(file)
+		if file != "" {
+			var err error
+			metadata, err = splitFile(file)
+			if err != nil {
+				fmt.Printf("[ERROR] file split failed: %v\n", err)
+				return
+			}
+			filesMetadata = append(filesMetadata, *metadata)
 		}
 	}
 
@@ -139,7 +159,7 @@ func LaunchRelayClient() {
 					if err := json.Unmarshal(payload, &incomingMeta); err == nil {
 						fmt.Printf("[RECEIVER] manifest: %s (%d chunks)\n", incomingMeta.FileName, incomingMeta.NumChunks)
 						activeDownloadMeta = &incomingMeta
-						go handleIncomingMetadata(conn, incomingMeta, peerID)
+						go handleIncomingMetadata(conn, incomingMeta)
 					} else {
 						fmt.Printf("[LOG] failed to map into ChunkMetadata struct: %v\n", err)
 					}
@@ -191,7 +211,7 @@ func LaunchRelayClient() {
 		return
 	}
 
-	if metadata != nil {
+	for _, metadata := range filesMetadata {
 		time.Sleep(500 * time.Millisecond)
 		metaJSON, _ := json.Marshal(metadata)
 		sendPayload(conn, metaJSON)
@@ -221,9 +241,14 @@ func checkProgress(meta *ChunkMetadata) {
 
 	fmt.Printf("\r[RECEIVER] download progress: %.2f%% (%d/%d chunks)", percent, count, meta.NumChunks)
 
+	currentUser, err := user.Current()
+	if err != nil {
+		log.Fatalf("Failed to get current user: %v", err)
+	}
+
 	if count == meta.NumChunks {
 		fmt.Println("\n[RECEIVER] Transfer complete, reassembling...")
-		if err := ReassembleFile(*meta, "./downloads"); err == nil {
+		if err := ReassembleFile(*meta, "/Users/"+currentUser.Username+"/Downloads"); err == nil {
 			VerifyAndFinalize(*meta)
 			for _, m := range matches {
 				os.Remove(m)
@@ -233,7 +258,9 @@ func checkProgress(meta *ChunkMetadata) {
 }
 
 // requests all chunks from the peer
-func handleIncomingMetadata(conn net.Conn, meta ChunkMetadata, targetID string) {
+func handleIncomingMetadata(conn net.Conn, meta ChunkMetadata) {
+
+	// add check for existing file and comparision
 
 	// Safety delay
 	time.Sleep(300 * time.Millisecond)
@@ -299,7 +326,12 @@ func ReassembleFile(meta ChunkMetadata, outputDir string) error {
 // post-reassembly SHA256 integrity check
 func VerifyAndFinalize(meta ChunkMetadata) {
 	fmt.Println("[SYSTEM] SHA256 integrity check...")
-	finalPath := filepath.Join("downloads", meta.FileName)
+	currentUser, err := user.Current()
+	if err != nil {
+		log.Fatalf("Failed to get current user: %v", err)
+	}
+	dir := "/Users/" + currentUser.Username + "/Downloads"
+	finalPath := filepath.Join(dir, meta.FileName)
 	f, _ := os.Open(finalPath)
 	defer f.Close()
 
@@ -313,4 +345,30 @@ func VerifyAndFinalize(meta ChunkMetadata) {
 		}
 	}
 	fmt.Println("[SYSTEM] file is bit-perfect match")
+}
+
+func GetAllFiles(root string) ([]string, error) {
+	var files []string
+
+	// filepath.WalkDir walks the file tree rooted at root, calling a function for each file or directory.
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Handle the error and decide whether to continue or stop walking
+			// (e.g., a permission error on a specific subdirectory).
+			log.Printf("Error accessing path %s: %v\n", path, err)
+			return err
+		}
+
+		// Check if the current entry is a file (not a directory).
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error walking the path %s: %w", root, err)
+	}
+
+	return files, nil
 }
