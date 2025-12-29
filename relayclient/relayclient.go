@@ -62,19 +62,18 @@ func LaunchRelayClient() {
 	}
 
 	host := "relaysvr-didactic-lemon-fiesta.herokuapp.com:443"
-	config := &tls.Config{
-		// Heroku's certificates are valid, so standard config works
-		InsecureSkipVerify: false,
+
+	// 1. Create a TLS configuration
+	tlsConfig := &tls.Config{
+		// Standard Heroku certs are trusted by default
+		ServerName: "relaysvr-didactic-lemon-fiesta.herokuapp.com",
 	}
 
-	// conn, err := net.Dial("tcp", url)
-	// if err != nil {
-	// 	fmt.Printf("[ERROR] Dial failed: %v\n", err)
-	// 	return
-	// }
-	conn, err := tls.Dial("tcp", host, config)
+	// 2. Use tls.Dial instead of net.Dial
+	conn, err := tls.Dial("tcp", host, tlsConfig)
 	if err != nil {
-		log.Fatalf("TLS Connection failed: %v", err)
+		fmt.Printf("[ERROR] TLS connection failed: %v\n", err)
+		return
 	}
 
 	fmt.Println("[SYSTEM] Connected securely to Heroku Relay!")
