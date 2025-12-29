@@ -63,13 +63,10 @@ func LaunchRelayClient() {
 
 	host := "relaysvr-didactic-lemon-fiesta.herokuapp.com:443"
 
-	// 1. Create a TLS configuration
 	tlsConfig := &tls.Config{
-		// Standard Heroku certs are trusted by default
 		ServerName: "relaysvr-didactic-lemon-fiesta.herokuapp.com",
 	}
 
-	// 2. Use tls.Dial instead of net.Dial
 	conn, err := tls.Dial("tcp", host, tlsConfig)
 	if err != nil {
 		fmt.Printf("[ERROR] TLS connection failed: %v\n", err)
@@ -81,10 +78,22 @@ func LaunchRelayClient() {
 
 	// register with the relay server
 	fmt.Printf("[SYSTEM] Registering as %s...\n", clientID)
-	conn.Write([]byte{byte(len(clientID))})
-	conn.Write([]byte(clientID))
-	conn.Write([]byte{byte(len(secret))})
-	conn.Write([]byte(secret))
+	// conn.Write([]byte{byte(len(clientID))})
+	// conn.Write([]byte(clientID))
+	// conn.Write([]byte{byte(len(secret))})
+	// conn.Write([]byte(secret))
+	regBuf := []byte{}
+	regBuf = append(regBuf, byte(len(clientID)))
+	regBuf = append(regBuf, []byte(clientID)...)
+	regBuf = append(regBuf, byte(len(secret)))
+	regBuf = append(regBuf, []byte(secret)...)
+
+	n, err := conn.Write(regBuf)
+	if err != nil {
+		fmt.Printf("[ERROR] Registration write failed: %v\n", err)
+		return
+	}
+	fmt.Printf("[DEBUG] Wrote %d bytes to server\n", n)
 
 	connectedSignal := make(chan string, 1)
 

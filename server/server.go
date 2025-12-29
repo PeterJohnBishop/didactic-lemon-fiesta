@@ -105,7 +105,7 @@ func (h *Hub) handleWithHeartbeat(conn net.Conn) {
 
 	if matched && peerID != client.ID {
 		if peer, exists := h.clients[peerID]; exists {
-			fmt.Printf("[MATCH] %s <> %s linked on secret %s\n", client.ID, peer.ID, secret)
+			fmt.Printf("[MATCH] %s <> %s linked\n", client.ID, peer.ID)
 
 			client.TargetID = peer.ID
 			peer.TargetID = client.ID
@@ -120,7 +120,6 @@ func (h *Hub) handleWithHeartbeat(conn net.Conn) {
 			peer.sendProtocolMsg([]byte("CONNECTED:" + client.ID))
 
 			h.runRelayLoop(client)
-
 			h.cleanup(client.ID)
 			return
 		}
