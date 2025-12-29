@@ -1,21 +1,23 @@
 package server
 
 import (
-	"bufio"
-	"encoding/binary"
 	"fmt"
-	"io"
-	"net"
+	"net/http"
 	"os"
 	"sync"
+
+	"github.com/gorilla/websocket"
 )
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
 
 type Client struct {
 	ID       string
 	Secret   string
 	TargetID string
-	Conn     net.Conn
-	Writer   *bufio.Writer
+	Conn     *websocket.Conn
 	Outgoing chan []byte
 }
 
@@ -36,144 +38,78 @@ func LaunchRelayServer() {
 		secrets: make(map[string]string),
 	}
 
-	listener, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		fmt.Printf("[ERROR] failed to start server: %v\n", err)
-		return
-	}
-
-	fmt.Printf("[SYSTEM] relay server active on :%s\n", port)
-
-	for {
-		conn, err := listener.Accept()
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			fmt.Printf("[ERROR] Accept error: %v\n", err)
-			continue
+			fmt.Printf("[ERROR] Upgrade failed: %v\n", err)
+			return
 		}
-		go hub.handleWithHeartbeat(conn)
+		go hub.handleWebSocket(wsConn)
+	})
+
+	fmt.Printf("[SYSTEM] WebSocket Relay active on :%s\n", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		fmt.Printf("[ERROR] Server failed: %v\n", err)
 	}
 }
 
-func (c *Client) writeLoop() {
-	defer fmt.Printf("[DEBUG] %s exited writeloop\n", c.ID)
-	for msg := range c.Outgoing {
-		if c.Conn == nil {
-			return
-		}
-		_, err := c.Writer.Write(msg)
-		if err != nil {
-			fmt.Printf("[ERROR] write failed for %s: %v\n", c.ID, err)
-			return
-		}
-		c.Writer.Flush()
-	}
-}
-
-func (h *Hub) handleWithHeartbeat(conn net.Conn) {
-	fmt.Printf("[DEBUG] New raw connection from %s\n", conn.RemoteAddr())
-
-	// 1. Read Client ID Length
-	idLenBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, idLenBuf); err != nil {
-		fmt.Printf("[DEBUG] Failed to read ID length: %v\n", err)
+func (h *Hub) handleWebSocket(conn *websocket.Conn) {
+	_, message, err := conn.ReadMessage()
+	if err != nil || len(message) < 2 {
 		conn.Close()
 		return
 	}
 
-	// 2. Read Client ID
-	idBuf := make([]byte, idLenBuf[0])
-	if _, err := io.ReadFull(conn, idBuf); err != nil {
-		fmt.Printf("[DEBUG] Failed to read ID body: %v\n", err)
-		conn.Close()
-		return
-	}
-	clientID := string(idBuf)
-
-	// 3. Read Secret Length
-	secretLenBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, secretLenBuf); err != nil {
-		fmt.Printf("[DEBUG] Failed to read Secret length: %v\n", err)
-		conn.Close()
-		return
-	}
-
-	// 4. Read Secret
-	secretBuf := make([]byte, secretLenBuf[0])
-	if _, err := io.ReadFull(conn, secretBuf); err != nil {
-		fmt.Printf("[DEBUG] Failed to read Secret body: %v\n", err)
-		conn.Close()
-		return
-	}
-	secret := string(secretBuf)
+	idLen := int(message[0])
+	clientID := string(message[1 : 1+idLen])
+	secLen := int(message[1+idLen])
+	secret := string(message[2+idLen : 2+idLen+secLen])
 
 	client := &Client{
 		ID:       clientID,
 		Secret:   secret,
 		Conn:     conn,
-		Writer:   bufio.NewWriterSize(conn, 32*1024),
 		Outgoing: make(chan []byte, 256),
 	}
 
-	fmt.Printf("[SYSTEM] Authenticated: %s (Secret: %s)\n", client.ID, client.Secret)
+	fmt.Printf("[SYSTEM] Authenticated: %s (Secret: %s)\n", clientID, secret)
 
 	h.mu.Lock()
-	h.clients[client.ID] = client
+	h.clients[clientID] = client
 	peerID, matched := h.secrets[secret]
 
-	if matched && peerID != client.ID {
+	if matched && peerID != clientID {
 		if peer, exists := h.clients[peerID]; exists {
-			fmt.Printf("[MATCH] %s <> %s linked on secret %s\n", client.ID, peer.ID, secret)
-
 			client.TargetID = peer.ID
 			peer.TargetID = client.ID
-
 			delete(h.secrets, secret)
 			h.mu.Unlock()
 
-			// Start writing goroutines for both
 			go client.writeLoop()
 			go peer.writeLoop()
 
-			// Alert both clients
 			client.sendProtocolMsg([]byte("CONNECTED:" + peer.ID))
 			peer.sendProtocolMsg([]byte("CONNECTED:" + client.ID))
 
-			// Run relay for this client (blocks this handler)
 			h.runRelayLoop(client)
 			h.cleanup(client.ID)
 			return
 		}
 	}
 
-	// No peer found, register secret and wait
-	h.secrets[secret] = client.ID
+	h.secrets[secret] = clientID
 	h.mu.Unlock()
 
-	fmt.Printf("[SYSTEM] %s waiting for peer with secret %s...\n", client.ID, secret)
 	go client.writeLoop()
-
 	h.runRelayLoop(client)
 	h.cleanup(client.ID)
 }
 
 func (h *Hub) runRelayLoop(client *Client) {
 	defer client.Conn.Close()
-
 	for {
-		var pSize uint32
-		err := binary.Read(client.Conn, binary.BigEndian, &pSize)
+		_, message, err := client.Conn.ReadMessage()
 		if err != nil {
-			// Expected on disconnect
-			break
-		}
-
-		if pSize == 0 {
-			continue // Keep-alive
-		}
-
-		payload := make([]byte, pSize)
-		if _, err := io.ReadFull(client.Conn, payload); err != nil {
-			fmt.Printf("[ERROR] failed to read payload for %s: %v\n", client.ID, err)
 			break
 		}
 
@@ -182,14 +118,7 @@ func (h *Hub) runRelayLoop(client *Client) {
 		h.mu.RUnlock()
 
 		if targetID != "" {
-			// Prepend size and forward
-			fullPacket := make([]byte, 4+pSize)
-			binary.BigEndian.PutUint32(fullPacket[0:4], pSize)
-			copy(fullPacket[4:], payload)
-
-			h.forward(targetID, fullPacket)
-		} else {
-			fmt.Printf("[DEBUG] dropped %d bytes from %s: No peer\n", pSize, client.ID)
+			h.forward(targetID, message)
 		}
 	}
 }
@@ -203,18 +132,21 @@ func (h *Hub) forward(targetID string, payload []byte) {
 		select {
 		case target.Outgoing <- payload:
 		default:
-			fmt.Printf("[WARNING] buffer full for %s, dropping packet\n", targetID)
+		}
+	}
+}
+
+func (c *Client) writeLoop() {
+	for msg := range c.Outgoing {
+		if err := c.Conn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+			return
 		}
 	}
 }
 
 func (c *Client) sendProtocolMsg(data []byte) {
-	buf := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint32(buf[0:4], uint32(len(data)))
-	copy(buf[4:], data)
-
 	select {
-	case c.Outgoing <- buf:
+	case c.Outgoing <- data:
 	default:
 	}
 }
@@ -222,25 +154,14 @@ func (c *Client) sendProtocolMsg(data []byte) {
 func (h *Hub) cleanup(id string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	client, exists := h.clients[id]
-	if exists {
-		// Clean up secrets associated with this ID
+	if client, exists := h.clients[id]; exists {
 		for sec, cid := range h.secrets {
 			if cid == id {
 				delete(h.secrets, sec)
 			}
 		}
 		delete(h.clients, id)
-
-		// Signal Target that peer is gone
-		if client.TargetID != "" {
-			if target, ok := h.clients[client.TargetID]; ok {
-				target.TargetID = ""
-			}
-		}
-
 		close(client.Outgoing)
-		fmt.Printf("[SYSTEM] cleaned up client %s\n", id)
+		fmt.Printf("[SYSTEM] Cleaned up %s\n", id)
 	}
 }

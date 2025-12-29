@@ -3,7 +3,6 @@ package relayclient
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -11,12 +10,13 @@ import (
 	"io/fs"
 	"log"
 	"math/big"
-	"net"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -38,10 +38,9 @@ var filesMetadata []ChunkMetadata
 var dir string
 
 func LaunchRelayClient() {
-	// create necessary directories
 	os.MkdirAll("temp_chunks", os.ModePerm)
 	os.MkdirAll("chunks", os.ModePerm)
-	// url := "https://dashboard.heroku.com/apps/relaysvr-didactic-lemon-fiesta"
+
 	secret := os.Getenv("SECRET")
 	clientID, _ := GenerateID(8)
 
@@ -54,149 +53,109 @@ func LaunchRelayClient() {
 	if err != nil {
 		log.Fatalf("Failed to get current user: %v", err)
 	}
-	dir := "/Users/" + currentUser.Username + "/Downloads"
+	dir = "/Users/" + currentUser.Username + "/Downloads"
 
 	filesMetadata, err := scanForFiles(dir)
 	if err != nil {
 		log.Fatalf("Failed to scan for files: %v", err)
 	}
 
-	host := "relaysvr-didactic-lemon-fiesta.herokuapp.com:443"
+	// Connect using WebSockets (WSS for Heroku)
+	u := "wss://relaysvr-didactic-lemon-fiesta.herokuapp.com/"
+	fmt.Printf("[SYSTEM] Connecting to %s...\n", u)
 
-	tlsConfig := &tls.Config{
-		ServerName: "relaysvr-didactic-lemon-fiesta.herokuapp.com",
-	}
-
-	conn, err := tls.Dial("tcp", host, tlsConfig)
+	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
 	if err != nil {
-		fmt.Printf("[ERROR] TLS connection failed: %v\n", err)
-		return
+		log.Fatalf("[ERROR] WebSocket connection failed: %v", err)
 	}
-
-	fmt.Println("[SYSTEM] Connected securely to Heroku Relay!")
 	defer conn.Close()
 
-	// register with the relay server
+	fmt.Println("[SYSTEM] Connected securely to Heroku Relay via WebSocket!")
+
 	fmt.Printf("[SYSTEM] Registering as %s...\n", clientID)
-	// conn.Write([]byte{byte(len(clientID))})
-	// conn.Write([]byte(clientID))
-	// conn.Write([]byte{byte(len(secret))})
-	// conn.Write([]byte(secret))
 	regBuf := []byte{}
 	regBuf = append(regBuf, byte(len(clientID)))
 	regBuf = append(regBuf, []byte(clientID)...)
 	regBuf = append(regBuf, byte(len(secret)))
 	regBuf = append(regBuf, []byte(secret)...)
 
-	n, err := conn.Write(regBuf)
+	err = conn.WriteMessage(websocket.BinaryMessage, regBuf)
 	if err != nil {
 		fmt.Printf("[ERROR] Registration write failed: %v\n", err)
 		return
 	}
-	fmt.Printf("[DEBUG] Wrote %d bytes to server\n", n)
 
 	connectedSignal := make(chan string, 1)
 
-	// main listener
 	go func() {
 		fmt.Println("[DEBUG] Listener goroutine started")
 		defer close(connectedSignal)
 		var peerID string
 
 		for {
-			conn.SetReadDeadline(time.Now().Add(300 * time.Second))
-
-			// read size
-			var pSize uint32
-			err := binary.Read(conn, binary.BigEndian, &pSize)
+			_, payload, err := conn.ReadMessage()
 			if err != nil {
+				fmt.Printf("[SYSTEM] Connection closed: %v\n", err)
 				return
 			}
-
-			if pSize == 0 {
-				// it's a keep-alive ping
-				continue
-			}
-
-			fmt.Printf("[LOG] new packet detected. Size: %d bytes\n", pSize)
-
-			payload := make([]byte, pSize)
-			n, err := io.ReadFull(conn, payload)
-			if err != nil {
-				fmt.Printf("[LOG] error reading payload: expected %d bytes, only got %d. error: %v\n", pSize, n, err)
-				return
-			}
-			dataStr := string(payload)
 
 			if len(payload) == 0 {
 				continue
 			}
 
+			dataStr := string(payload)
 			headerByte := payload[0]
 
 			switch headerByte {
-			case 0xAA:
+			case 0xAA: // File Chunk
 				if len(payload) < 5 {
 					continue
 				}
 				index := binary.BigEndian.Uint32(payload[1:5])
-				fmt.Printf("[LOG] extracted chunk index %d\n", index)
+				fmt.Printf("[LOG] Received chunk index %d (%d bytes)\n", index, len(payload)-5)
 
 				if activeDownloadMeta != nil {
-					fmt.Printf("[LOG] writing chunk %d for file %s\n", index, activeDownloadMeta.FileName)
 					saveChunk(activeDownloadMeta.FileName, index, payload[5:])
 					checkProgress(activeDownloadMeta)
 				} else {
-					fmt.Println("[LOG] error: activeDownloadMeta is nil, cannot save chunk")
+					fmt.Println("[LOG] Error: activeDownloadMeta is nil, cannot save chunk")
 				}
-				continue
 
-			case '{':
+			case '{': // JSON Metadata or Requests
 				var generic map[string]interface{}
 				if err := json.Unmarshal(payload, &generic); err != nil {
-					fmt.Printf("[LOG] unmarshal failed: %v\n", err)
 					continue
 				}
-				fmt.Printf("[LOG] parsed keys: %v\n", getMapKeys(generic))
 
+				// Case: Incoming File Manifest
 				if _, ok := generic["file_name"]; ok {
 					var incomingMeta ChunkMetadata
 					if err := json.Unmarshal(payload, &incomingMeta); err == nil {
-						fmt.Printf("[RECEIVER] manifest: %s (%d chunks)\n", incomingMeta.FileName, incomingMeta.NumChunks)
+						fmt.Printf("[RECEIVER] Manifest received: %s (%d chunks)\n", incomingMeta.FileName, incomingMeta.NumChunks)
 						activeDownloadMeta = &incomingMeta
 						go handleIncomingMetadata(conn, incomingMeta)
-					} else {
-						fmt.Printf("[LOG] failed to map into ChunkMetadata struct: %v\n", err)
 					}
 					continue
 				}
 
+				// Case: Peer Requesting a Chunk
 				if val, ok := generic["type"].(string); ok && val == "CHUNK_REQ" {
-					file, okF := generic["file"].(string)
-					indexFloat, okI := generic["index"].(float64) // JSON numbers are float64 in Go maps
+					fileName, okF := generic["file"].(string)
+					indexFloat, okI := generic["index"].(float64)
 
-					if !okF || !okI {
-						continue
+					if okF && okI {
+						idx := int(indexFloat)
+						chunkPath := filepath.Join("chunks", fmt.Sprintf("%s.chunk.%d", fileName, idx))
+						chunkData, err := os.ReadFile(chunkPath)
+						if err == nil {
+							sendPayload(conn, wrapChunk(idx, chunkData))
+							fmt.Printf("[SENDER] Sent chunk %d for %s\n", idx, fileName)
+						}
 					}
-
-					index := int(indexFloat)
-					fmt.Printf("[SENDER] processing request: %s (Part %d)\n", file, index)
-
-					chunkPath := filepath.Join("chunks", fmt.Sprintf("%s.chunk.%d", file, index))
-
-					chunkData, err := os.ReadFile(chunkPath)
-					if err != nil {
-						fmt.Printf("[ERROR] sender disk read failed for chunk %d: %v\n", index, err)
-						continue
-					}
-
-					fmt.Printf("[LOG] sender sending chunk %d (%d bytes)\n", index, len(chunkData))
-					sendPayload(conn, wrapChunk(index, chunkData))
-					fmt.Printf("[SENDER] successfully sent chunk %d\n", index)
 					continue
 				}
 
-			case 'C':
+			case 'C': // Protocol Messages (CONNECTED)
 				if strings.HasPrefix(dataStr, "CONNECTED:") {
 					peerID = strings.TrimPrefix(dataStr, "CONNECTED:")
 					connectedSignal <- peerID
@@ -204,8 +163,7 @@ func LaunchRelayClient() {
 				}
 
 			default:
-				fmt.Printf("[LOG] unhandled payload: %s\n", dataStr)
-				continue
+				fmt.Printf("[LOG] Unhandled payload: %s\n", dataStr)
 			}
 		}
 	}()
@@ -215,23 +173,26 @@ func LaunchRelayClient() {
 	if !ok {
 		return
 	}
+	fmt.Println("[SYSTEM] Peer matched! Starting sync...")
 
 	for _, metadata := range filesMetadata {
-		time.Sleep(500 * time.Millisecond)
 		metaJSON, _ := json.Marshal(metadata)
 		sendPayload(conn, metaJSON)
-		fmt.Printf("[SENDER] Metadata pushed (Size: %d)\n", len(metaJSON))
+		fmt.Printf("[SENDER] Metadata pushed: %s\n", metadata.FileName)
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	for {
-		binary.Write(conn, binary.BigEndian, uint32(0))
-		time.Sleep(20 * time.Second)
+		err := conn.WriteMessage(websocket.PingMessage, nil)
+		if err != nil {
+			return
+		}
+		time.Sleep(30 * time.Second)
 	}
 }
 
 func scanForFiles(dir string) ([]ChunkMetadata, error) {
 	// scan Downloads directory for files
-
 	files, err := GetAllFiles(dir)
 	if err != nil {
 		log.Fatal(err)
@@ -294,32 +255,18 @@ func checkProgress(meta *ChunkMetadata) {
 }
 
 // requests all chunks from the peer
-func handleIncomingMetadata(conn net.Conn, meta ChunkMetadata) {
-
-	// add check for existing file and comparision
-
-	// Safety delay
-	time.Sleep(300 * time.Millisecond)
-
+func handleIncomingMetadata(conn *websocket.Conn, meta ChunkMetadata) {
+	time.Sleep(500 * time.Millisecond)
 	for i, hash := range meta.ChunkHashes {
-		fmt.Printf("[LOG] requesting chunk index: %d\n", i)
-
 		request := map[string]interface{}{
 			"type":  "CHUNK_REQ",
 			"index": i,
 			"hash":  hash,
 			"file":  meta.FileName,
 		}
-
-		reqBytes, err := json.Marshal(request)
-		if err != nil {
-			continue
-		}
-
+		reqBytes, _ := json.Marshal(request)
 		sendPayload(conn, reqBytes)
-
-		fmt.Printf("[RECEIVER] request for chunk %d sent to relay\n", i)
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -336,9 +283,11 @@ func wrapChunk(index int, data []byte) []byte {
 	return buf
 }
 
-func sendPayload(conn net.Conn, data []byte) {
-	binary.Write(conn, binary.BigEndian, uint32(len(data)))
-	conn.Write(data)
+func sendPayload(conn *websocket.Conn, data []byte) {
+	err := conn.WriteMessage(websocket.BinaryMessage, data)
+	if err != nil {
+		fmt.Printf("[ERROR] Failed to send payload: %v\n", err)
+	}
 }
 
 // merges chunks into final file
