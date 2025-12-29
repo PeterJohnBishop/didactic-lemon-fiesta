@@ -20,6 +20,7 @@ type Client struct {
 	TargetID string
 	Conn     *websocket.Conn
 	Outgoing chan []byte
+	mu       sync.Mutex
 }
 
 type Hub struct {
@@ -161,7 +162,10 @@ func (h *Hub) forward(targetID string, payload []byte) {
 
 func (c *Client) writeLoop() {
 	for msg := range c.Outgoing {
-		if err := c.Conn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+		c.mu.Lock()
+		err := c.Conn.WriteMessage(websocket.BinaryMessage, msg)
+		c.mu.Unlock()
+		if err != nil {
 			return
 		}
 	}

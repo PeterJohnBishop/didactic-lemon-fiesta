@@ -56,9 +56,10 @@ func LaunchRelayClient() {
 	if err != nil {
 		log.Fatalf("Failed to get current user: %v", err)
 	}
+	// Use package-level 'dir' variable
 	dir = "/Users/" + currentUser.Username + "/Downloads"
 
-	filesMetadata, err := scanForFiles(dir)
+	filesMetadata, err = scanForFiles(dir)
 	if err != nil {
 		log.Fatalf("Failed to scan for files: %v", err)
 	}
@@ -68,13 +69,12 @@ func LaunchRelayClient() {
 		Host:   "relaysvr-didactic-lemon-fiesta-8fd835c555af.herokuapp.com",
 		Path:   "/",
 	}
-	fmt.Printf("[SYSTEM] Connecting to %s...\n", u)
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	fmt.Printf("[SYSTEM] Dialing %s...\n", u)
+	fmt.Printf("[SYSTEM] Dialing %s...\n", u.String())
 	conn, resp, err := dialer.Dial(u.String(), nil)
 	if err != nil {
 		if resp != nil {
@@ -133,9 +133,8 @@ func LaunchRelayClient() {
 				if activeDownloadMeta != nil {
 					saveChunk(activeDownloadMeta.FileName, index, payload[5:])
 					checkProgress(activeDownloadMeta)
-				} else {
-					fmt.Println("[LOG] Error: activeDownloadMeta is nil, cannot save chunk")
 				}
+				continue
 
 			case '{':
 				var generic map[string]interface{}
@@ -169,15 +168,12 @@ func LaunchRelayClient() {
 					continue
 				}
 
-			case 'C': // Protocol Messages (CONNECTED)
+			case 'C':
 				if strings.HasPrefix(dataStr, "CONNECTED:") {
 					peerID = strings.TrimPrefix(dataStr, "CONNECTED:")
 					connectedSignal <- peerID
 					continue
 				}
-
-			default:
-				fmt.Printf("[LOG] Unhandled payload: %s\n", dataStr)
 			}
 		}
 	}()
@@ -196,14 +192,17 @@ func LaunchRelayClient() {
 		time.Sleep(200 * time.Millisecond)
 	}
 
+	// Keep-alive Heartbeat loop
 	for {
 		writeMu.Lock()
+		// Send Ping every 20s to stay inside Heroku's 30s timeout
 		err := conn.WriteMessage(websocket.PingMessage, nil)
 		writeMu.Unlock()
 		if err != nil {
+			fmt.Printf("[SYSTEM] Heartbeat lost: %v\n", err)
 			return
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(20 * time.Second)
 	}
 }
 
@@ -213,63 +212,28 @@ func scanForFiles(dir string) ([]ChunkMetadata, error) {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("Found %d files in %s and its subdirectories:\n", len(files), dir)
-	var metadata *ChunkMetadata
+	fmt.Printf("Found %d files in %s and subdirectories\n", len(files), dir)
 	var allMetadata []ChunkMetadata
 	for _, file := range files {
-		fmt.Println(file)
 		info, err := os.Stat(file)
 		if err != nil {
-			log.Printf("Could not stat file %s: %v", file, err)
 			continue
 		}
-
-		// Get the last modified time
 		modTime := info.ModTime()
 
-		if file != "" {
-			var err error
-			metadata, err = splitFile(file, modTime)
-			if err != nil {
-				fmt.Printf("[ERROR] file split failed: %v\n", err)
-				return nil, err
-			}
-			allMetadata = append(allMetadata, *metadata)
+		metadata, err := splitFile(file, modTime)
+		if err != nil {
+			fmt.Printf("[ERROR] split failed: %v\n", err)
+			continue
 		}
+		allMetadata = append(allMetadata, *metadata)
 	}
-
 	return allMetadata, nil
 }
 
-func getMapKeys(m map[string]interface{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-func checkProgress(meta *ChunkMetadata) {
-	pattern := filepath.Join("temp_chunks", fmt.Sprintf("%s.part.*", meta.FileName))
-	matches, _ := filepath.Glob(pattern)
-	count := len(matches)
-	percent := (float64(count) / float64(meta.NumChunks)) * 100
-
-	fmt.Printf("\r[RECEIVER] download progress: %.2f%% (%d/%d chunks)", percent, count, meta.NumChunks)
-
-	if count == meta.NumChunks {
-		fmt.Println("\n[RECEIVER] Transfer complete, reassembling...")
-		if err := ReassembleFile(*meta); err == nil {
-			VerifyAndFinalize(*meta)
-			for _, m := range matches {
-				os.Remove(m)
-			}
-		}
-	}
-}
-
 func handleIncomingMetadata(conn *websocket.Conn, meta ChunkMetadata) {
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(2 * time.Second)
+
 	for i, hash := range meta.ChunkHashes {
 		request := map[string]interface{}{
 			"type":  "CHUNK_REQ",
@@ -279,7 +243,54 @@ func handleIncomingMetadata(conn *websocket.Conn, meta ChunkMetadata) {
 		}
 		reqBytes, _ := json.Marshal(request)
 		sendPayload(conn, reqBytes)
-		time.Sleep(50 * time.Millisecond)
+
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func sendPayload(conn *websocket.Conn, data []byte) {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	err := conn.WriteMessage(websocket.BinaryMessage, data)
+	if err != nil {
+		fmt.Printf("[ERROR] sendPayload: %v\n", err)
+	}
+}
+
+func GetAllFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// Ignore hidden files/system files
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
+}
+
+func checkProgress(meta *ChunkMetadata) {
+	pattern := filepath.Join("temp_chunks", fmt.Sprintf("%s.part.*", meta.FileName))
+	matches, _ := filepath.Glob(pattern)
+	count := len(matches)
+	percent := (float64(count) / float64(meta.NumChunks)) * 100
+
+	fmt.Printf("\r[RECEIVER] progress: %.2f%% (%d/%d chunks)", percent, count, meta.NumChunks)
+
+	if count == meta.NumChunks {
+		fmt.Println("\n[RECEIVER] Reassembling...")
+		if err := ReassembleFile(*meta); err == nil {
+			VerifyAndFinalize(*meta)
+			for _, m := range matches {
+				os.Remove(m)
+			}
+		}
 	}
 }
 
@@ -296,37 +307,15 @@ func wrapChunk(index int, data []byte) []byte {
 	return buf
 }
 
-func sendPayload(conn *websocket.Conn, data []byte) {
-	writeMu.Lock()
-	defer writeMu.Unlock()
-
-	err := conn.WriteMessage(websocket.BinaryMessage, data)
-	if err != nil {
-		fmt.Printf("[ERROR] Failed to send payload: %v\n", err)
-	}
-}
-
 func ReassembleFile(meta ChunkMetadata) error {
 	finalPath := filepath.Join(dir, meta.FileName)
 	tempPath := finalPath + ".tmp"
 
 	if _, err := os.Stat(finalPath); err == nil {
-		isMatch, err := VerifyExistingFile(meta, finalPath)
-		if err != nil {
-			return err
-		}
-
+		isMatch, _ := VerifyExistingFile(meta, finalPath)
 		if isMatch {
-			fmt.Printf("[SKIP] %s is already bit-perfect. Deleting incoming chunks.\n", meta.FileName)
 			return cleanupChunks(meta)
 		}
-
-		existingInfo, _ := os.Stat(finalPath)
-		if !meta.ModTime.After(existingInfo.ModTime()) {
-			fmt.Printf("[SKIP] Existing %s is newer or same age. Dropping update.\n", meta.FileName)
-			return cleanupChunks(meta)
-		}
-		fmt.Printf("[UPDATE] Incoming %s is newer. Replacing old file...\n", meta.FileName)
 	}
 
 	out, err := os.Create(tempPath)
@@ -336,66 +325,35 @@ func ReassembleFile(meta ChunkMetadata) error {
 
 	for i := 0; i < meta.NumChunks; i++ {
 		chunkPath := filepath.Join("temp_chunks", fmt.Sprintf("%s.part.%d", meta.FileName, i))
-		content, err := os.ReadFile(chunkPath)
-		if err != nil {
-			out.Close()
-			return err
-		}
+		content, _ := os.ReadFile(chunkPath)
 		out.Write(content)
 	}
 	out.Close()
-
-	if err := os.Rename(tempPath, finalPath); err != nil {
-		return err
-	}
-
+	os.Rename(tempPath, finalPath)
 	os.Chtimes(finalPath, time.Now(), meta.ModTime)
-
-	fmt.Printf("Successfully finalized: %s\n", finalPath)
 	return cleanupChunks(meta)
 }
 
 func VerifyAndFinalize(meta ChunkMetadata) {
-	fmt.Println("[SYSTEM] SHA256 integrity check...")
 	finalPath := filepath.Join(dir, meta.FileName)
 	f, _ := os.Open(finalPath)
 	defer f.Close()
 
 	for i, expectedHash := range meta.ChunkHashes {
 		buf := make([]byte, meta.ChunkSize)
-		n, _ := f.Read(buf)
+		n, err := f.Read(buf)
+		if err != nil && err != io.EOF {
+			break
+		}
+
 		actualHash := fmt.Sprintf("%x", sha256.Sum256(buf[:n]))
+
 		if actualHash != expectedHash {
 			fmt.Printf("[ERROR] chunk %d mismatch: expected %s, got %s\n", i, expectedHash, actualHash)
 			return
 		}
 	}
-	fmt.Println("[SYSTEM] file is bit-perfect match")
-}
-
-func GetAllFiles(root string) ([]string, error) {
-	var files []string
-
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if strings.HasPrefix(d.Name(), ".") {
-			return nil
-		}
-		if err != nil {
-			log.Printf("Error accessing path %s: %v\n", path, err)
-			return err
-		}
-
-		if !d.IsDir() {
-			files = append(files, path)
-		}
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("error walking the path %s: %w", root, err)
-	}
-
-	return files, nil
+	fmt.Println("[SYSTEM] File verified bit-perfect.")
 }
 
 func VerifyExistingFile(meta ChunkMetadata, filePath string) (bool, error) {
@@ -407,11 +365,7 @@ func VerifyExistingFile(meta ChunkMetadata, filePath string) (bool, error) {
 
 	for _, expectedHash := range meta.ChunkHashes {
 		buf := make([]byte, meta.ChunkSize)
-		n, err := f.Read(buf)
-		if err != nil && err != io.EOF {
-			return false, err
-		}
-
+		n, _ := f.Read(buf)
 		actualHash := fmt.Sprintf("%x", sha256.Sum256(buf[:n]))
 		if actualHash != expectedHash {
 			return false, nil
@@ -422,8 +376,7 @@ func VerifyExistingFile(meta ChunkMetadata, filePath string) (bool, error) {
 
 func cleanupChunks(meta ChunkMetadata) error {
 	for i := 0; i < meta.NumChunks; i++ {
-		chunkPath := filepath.Join("temp_chunks", fmt.Sprintf("%s.part.%d", meta.FileName, i))
-		os.Remove(chunkPath)
+		os.Remove(filepath.Join("temp_chunks", fmt.Sprintf("%s.part.%d", meta.FileName, i)))
 	}
 	return nil
 }
