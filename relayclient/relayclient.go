@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"math/big"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -60,7 +61,7 @@ func LaunchRelayClient() {
 		log.Fatalf("Failed to scan for files: %v", err)
 	}
 
-	u := "wss://relaysvr-didactic-lemon-fiesta.herokuapp.com"
+	u := url.URL{Scheme: "wss", Host: "relaysvr-didactic-lemon-fiesta.herokuapp.com", Path: "/"}
 	fmt.Printf("[SYSTEM] Connecting to %s...\n", u)
 
 	dialer := websocket.Dialer{
@@ -68,7 +69,7 @@ func LaunchRelayClient() {
 	}
 
 	fmt.Printf("[SYSTEM] Dialing %s...\n", u)
-	conn, resp, err := dialer.Dial(u, nil)
+	conn, resp, err := dialer.Dial(u.String(), nil)
 	if err != nil {
 		if resp != nil {
 			fmt.Printf("[ERROR] Handshake failed with status: %s\n", resp.Status)

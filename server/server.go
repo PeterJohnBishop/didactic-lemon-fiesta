@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"sync"
@@ -38,6 +39,8 @@ func LaunchRelayServer() {
 		secrets: make(map[string]string),
 	}
 
+	mux := http.NewServeMux()
+
 	var upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -46,20 +49,22 @@ func LaunchRelayServer() {
 		},
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Printf("[DEBUG] Incoming Request: %s %s from %s\n", r.Method, r.URL.Path, r.RemoteAddr)
-
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		fmt.Printf("[DEBUG] Request at: %s\n", r.URL.Path)
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			fmt.Printf("[ERROR] Upgrade failed: %v\n", err)
 			return
 		}
 		go hub.handleWebSocket(wsConn)
-	})
+	}
+
+	mux.HandleFunc("/", handler)
+	mux.HandleFunc("/ws", handler)
 
 	fmt.Printf("[SYSTEM] WebSocket Relay active on :%s\n", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		fmt.Printf("[ERROR] Server failed: %v\n", err)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Fatal(err)
 	}
 }
 
