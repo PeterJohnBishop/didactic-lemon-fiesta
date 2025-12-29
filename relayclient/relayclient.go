@@ -3,6 +3,7 @@ package relayclient
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -40,12 +41,12 @@ func LaunchRelayClient() {
 	// create necessary directories
 	os.MkdirAll("temp_chunks", os.ModePerm)
 	os.MkdirAll("chunks", os.ModePerm)
-	url := "https://dashboard.heroku.com/apps/relaysvr-didactic-lemon-fiesta"
+	// url := "https://dashboard.heroku.com/apps/relaysvr-didactic-lemon-fiesta"
 	secret := os.Getenv("SECRET")
 	clientID, _ := GenerateID(8)
 
-	if url == "" || secret == "" {
-		fmt.Println("[ERROR] SERVER_URL and SECRET are required")
+	if secret == "" {
+		fmt.Println("[ERROR] SECRET is required")
 		return
 	}
 
@@ -60,11 +61,23 @@ func LaunchRelayClient() {
 		log.Fatalf("Failed to scan for files: %v", err)
 	}
 
-	conn, err := net.Dial("tcp", url)
-	if err != nil {
-		fmt.Printf("[ERROR] Dial failed: %v\n", err)
-		return
+	host := "relaysvr-didactic-lemon-fiesta.herokuapp.com:443"
+	config := &tls.Config{
+		// Heroku's certificates are valid, so standard config works
+		InsecureSkipVerify: false,
 	}
+
+	// conn, err := net.Dial("tcp", url)
+	// if err != nil {
+	// 	fmt.Printf("[ERROR] Dial failed: %v\n", err)
+	// 	return
+	// }
+	conn, err := tls.Dial("tcp", host, config)
+	if err != nil {
+		log.Fatalf("TLS Connection failed: %v", err)
+	}
+
+	fmt.Println("[SYSTEM] Connected securely to Heroku Relay!")
 	defer conn.Close()
 
 	// register with the relay server
