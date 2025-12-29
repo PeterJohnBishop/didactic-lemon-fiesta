@@ -99,6 +99,7 @@ func LaunchRelayClient() {
 
 	// main listener
 	go func() {
+		fmt.Println("[DEBUG] Listener goroutine started")
 		defer close(connectedSignal)
 		var peerID string
 

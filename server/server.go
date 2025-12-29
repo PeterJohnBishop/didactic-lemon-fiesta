@@ -18,6 +18,7 @@ type Client struct {
 	Writer   *bufio.Writer
 	Outgoing chan []byte
 }
+
 type Hub struct {
 	secrets map[string]string
 	clients map[string]*Client
@@ -53,7 +54,6 @@ func LaunchRelayServer() {
 	}
 }
 
-// writeLoop pulls data from the Outgoing channel sends it!
 func (c *Client) writeLoop() {
 	defer fmt.Printf("[DEBUG] %s exited writeloop\n", c.ID)
 	for msg := range c.Outgoing {
@@ -69,23 +69,41 @@ func (c *Client) writeLoop() {
 	}
 }
 
-// manages the iregistration and matchmaking
 func (h *Hub) handleWithHeartbeat(conn net.Conn) {
-	// read Client ID
+	fmt.Printf("[DEBUG] New raw connection from %s\n", conn.RemoteAddr())
+
+	// 1. Read Client ID Length
 	idLenBuf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, idLenBuf); err != nil {
+		fmt.Printf("[DEBUG] Failed to read ID length: %v\n", err)
 		conn.Close()
 		return
 	}
+
+	// 2. Read Client ID
 	idBuf := make([]byte, idLenBuf[0])
-	io.ReadFull(conn, idBuf)
+	if _, err := io.ReadFull(conn, idBuf); err != nil {
+		fmt.Printf("[DEBUG] Failed to read ID body: %v\n", err)
+		conn.Close()
+		return
+	}
 	clientID := string(idBuf)
 
-	// read Secret
+	// 3. Read Secret Length
 	secretLenBuf := make([]byte, 1)
-	io.ReadFull(conn, secretLenBuf)
+	if _, err := io.ReadFull(conn, secretLenBuf); err != nil {
+		fmt.Printf("[DEBUG] Failed to read Secret length: %v\n", err)
+		conn.Close()
+		return
+	}
+
+	// 4. Read Secret
 	secretBuf := make([]byte, secretLenBuf[0])
-	io.ReadFull(conn, secretBuf)
+	if _, err := io.ReadFull(conn, secretBuf); err != nil {
+		fmt.Printf("[DEBUG] Failed to read Secret body: %v\n", err)
+		conn.Close()
+		return
+	}
 	secret := string(secretBuf)
 
 	client := &Client{
@@ -96,16 +114,15 @@ func (h *Hub) handleWithHeartbeat(conn net.Conn) {
 		Outgoing: make(chan []byte, 256),
 	}
 
-	fmt.Printf("[SYSTEM] connection: %s (secret: %s)\n", client.ID, client.Secret)
+	fmt.Printf("[SYSTEM] Authenticated: %s (Secret: %s)\n", client.ID, client.Secret)
 
 	h.mu.Lock()
 	h.clients[client.ID] = client
-
 	peerID, matched := h.secrets[secret]
 
 	if matched && peerID != client.ID {
 		if peer, exists := h.clients[peerID]; exists {
-			fmt.Printf("[MATCH] %s <> %s linked\n", client.ID, peer.ID)
+			fmt.Printf("[MATCH] %s <> %s linked on secret %s\n", client.ID, peer.ID, secret)
 
 			client.TargetID = peer.ID
 			peer.TargetID = client.ID
@@ -113,50 +130,50 @@ func (h *Hub) handleWithHeartbeat(conn net.Conn) {
 			delete(h.secrets, secret)
 			h.mu.Unlock()
 
+			// Start writing goroutines for both
 			go client.writeLoop()
 			go peer.writeLoop()
 
+			// Alert both clients
 			client.sendProtocolMsg([]byte("CONNECTED:" + peer.ID))
 			peer.sendProtocolMsg([]byte("CONNECTED:" + client.ID))
 
+			// Run relay for this client (blocks this handler)
 			h.runRelayLoop(client)
 			h.cleanup(client.ID)
 			return
 		}
 	}
 
-	// no peer yet, register the secret and wait
+	// No peer found, register secret and wait
 	h.secrets[secret] = client.ID
 	h.mu.Unlock()
 
+	fmt.Printf("[SYSTEM] %s waiting for peer with secret %s...\n", client.ID, secret)
 	go client.writeLoop()
 
 	h.runRelayLoop(client)
 	h.cleanup(client.ID)
 }
 
-// handles incoming data and forwards data to the target.
 func (h *Hub) runRelayLoop(client *Client) {
 	defer client.Conn.Close()
 
 	for {
 		var pSize uint32
-		// read 4-byte size
 		err := binary.Read(client.Conn, binary.BigEndian, &pSize)
 		if err != nil {
-			fmt.Printf("[SYSTEM] %s disconnected\n", client.ID)
+			// Expected on disconnect
 			break
 		}
 
 		if pSize == 0 {
-			// it's a ping to keep the connection alive
-			continue
+			continue // Keep-alive
 		}
 
-		// Read the payload
 		payload := make([]byte, pSize)
 		if _, err := io.ReadFull(client.Conn, payload); err != nil {
-			fmt.Printf("[ERROR] readFull failed for %s\n", client.ID)
+			fmt.Printf("[ERROR] failed to read payload for %s: %v\n", client.ID, err)
 			break
 		}
 
@@ -165,19 +182,18 @@ func (h *Hub) runRelayLoop(client *Client) {
 		h.mu.RUnlock()
 
 		if targetID != "" {
+			// Prepend size and forward
 			fullPacket := make([]byte, 4+pSize)
 			binary.BigEndian.PutUint32(fullPacket[0:4], pSize)
 			copy(fullPacket[4:], payload)
 
 			h.forward(targetID, fullPacket)
 		} else {
-			// when Client A sends data before Client B connects
-			fmt.Printf("[DEBUG] dropped %d bytes from %s: No peer matched yet\n", pSize, client.ID)
+			fmt.Printf("[DEBUG] dropped %d bytes from %s: No peer\n", pSize, client.ID)
 		}
 	}
 }
 
-// forward safely delivers a payload to a target client outgoing chan
 func (h *Hub) forward(targetID string, payload []byte) {
 	h.mu.RLock()
 	target, exists := h.clients[targetID]
@@ -189,12 +205,9 @@ func (h *Hub) forward(targetID string, payload []byte) {
 		default:
 			fmt.Printf("[WARNING] buffer full for %s, dropping packet\n", targetID)
 		}
-	} else {
-		fmt.Printf("[ERROR] Forward failed: Target %s not in client map\n", targetID)
 	}
 }
 
-// wraps raw bytes in the 4-byte size header and queues for sending for messages
 func (c *Client) sendProtocolMsg(data []byte) {
 	buf := make([]byte, 4+len(data))
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(data)))
@@ -206,19 +219,27 @@ func (c *Client) sendProtocolMsg(data []byte) {
 	}
 }
 
-// removes the client and their associated secret on disconnect
 func (h *Hub) cleanup(id string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	client, exists := h.clients[id]
 	if exists {
+		// Clean up secrets associated with this ID
 		for sec, cid := range h.secrets {
 			if cid == id {
 				delete(h.secrets, sec)
 			}
 		}
 		delete(h.clients, id)
+
+		// Signal Target that peer is gone
+		if client.TargetID != "" {
+			if target, ok := h.clients[client.TargetID]; ok {
+				target.TargetID = ""
+			}
+		}
+
 		close(client.Outgoing)
 		fmt.Printf("[SYSTEM] cleaned up client %s\n", id)
 	}
