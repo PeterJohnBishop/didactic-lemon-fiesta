@@ -61,7 +61,11 @@ func LaunchRelayClient() {
 		log.Fatalf("Failed to scan for files: %v", err)
 	}
 
-	u := url.URL{Scheme: "wss", Host: "relaysvr-didactic-lemon-fiesta.herokuapp.com", Path: "/"}
+	u := url.URL{
+		Scheme: "wss",
+		Host:   "relaysvr-didactic-lemon-fiesta-8fd835c555af.herokuapp.com",
+		Path:   "/",
+	}
 	fmt.Printf("[SYSTEM] Connecting to %s...\n", u)
 
 	dialer := websocket.Dialer{
