@@ -31,7 +31,7 @@ OR
 
 if Client A has a file that Client B doesn't have, send the manifest from Client A to Client B, for Client B to download. 
 
-# Recieving a file placed into the corresponding directory on a separate device
+### File Sync Example: Recieving a file placed into the corresponding directory on a separate device
 ![screenshot](https://github.com/PeterJohnBishop/TCP-Relay-ServerClient/blob/main/assets/Screenshot%202025-12-29%20at%202.28.14%E2%80%AFAM.png?raw=true)
 
 
